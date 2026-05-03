@@ -4,10 +4,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ovn-kubernetes/ovn-kubernetes/openshift/test"
-	ocpdeploymentconfig "github.com/ovn-kubernetes/ovn-kubernetes/openshift/test/deploymentconfig"
-	"github.com/ovn-kubernetes/ovn-kubernetes/openshift/test/generated"
-	ocpinfraprovider "github.com/ovn-kubernetes/ovn-kubernetes/openshift/test/infraprovider"
+	"github.com/ovn-kubernetes/ovn-kubernetes/openshift/pkg"
+	ocpdeploymentconfig "github.com/ovn-kubernetes/ovn-kubernetes/openshift/pkg/deploymentconfig"
+	"github.com/ovn-kubernetes/ovn-kubernetes/openshift/pkg/generated"
+	ocpinfraprovider "github.com/ovn-kubernetes/ovn-kubernetes/openshift/pkg/infraprovider"
 
 	// import ovn-kubernetes tests
 	_ "github.com/ovn-kubernetes/ovn-kubernetes/test/e2e"

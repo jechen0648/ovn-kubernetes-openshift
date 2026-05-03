@@ -92,16 +92,16 @@ func init() {
 // labelAppender is used to select tests and append labels to a ginkgo test name. It can select tests based on labels or regex or
 // substring match. Prepended labels to a test name is not supported because ginkgo API does not allow it.
 type labelAppender struct {
-	// all labels we care about applying rules to and defined in openshift/test/pkg/annotate/rules.go derived from LabelToTestNameMatchMaps & LabelToTestNameMatchMaps
+	// all labels we care about applying rules to and defined in openshift/pkg/annotate/rules.go derived from LabelToTestNameMatchMaps & LabelToTestNameMatchMaps
 	labels []string
 	// substrings match to apply a particular label derived from LabelToTestNameMatchMaps map
 	stringMatches map[string][]string
 	// regular expressions match to apply a particular label derived from LabelToTestNameMatchMaps map
 	matches map[string]*regexp.Regexp
 	// regular expressions match
-	// see ExcludedTests in openshift/test/pkg/annotate/rules.go
+	// see ExcludedTests in openshift/pkg/annotate/rules.go
 	excludedTestsFilter *regexp.Regexp
-	// key is label which maps to a list of labels defined in openshift/test/pkg/annotate/rules.go LabelToLabelMaps map
+	// key is label which maps to a list of labels defined in openshift/pkg/annotate/rules.go LabelToLabelMaps map
 	labelToLabel map[string][]string
 
 	// output from the generator and also input for appendLabelsToTestName
