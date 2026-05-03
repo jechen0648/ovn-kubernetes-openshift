@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"text/template"
-
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -43,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/kubectl/pkg/util/podutils"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
@@ -2722,7 +2722,376 @@ var _ = ginkgo.Describe("BGP: For BGP configured networks", feature.RouteAdverti
 		},
 		networksToTest,
 	)
+
+	ginkgo.It("Validates BUM suppression is in effect for a L2 EVPN MAC-VRF network", feature.EVPN, func() {
+		if !isLocalGWModeEnabled() {
+			e2eskipper.Skipf("BUM suppression test on L2 EVPN requires Local Gateway mode")
+		}
+		// Short CUDN/VTEP base name: keeps evx4/evx6-<vtepName> within Linux's 15-char iface limit where possible.
+		const bumTestBaseName = "bsup"
+		ictx := infraprovider.Get().NewTestContext()
+		testSuffix := framework.RandomSuffix()
+		bumTestNetworkName := bumTestBaseName + testSuffix
+		ipFamilySet := sets.New(getSupportedIPFamiliesSlice(f.ClientSet)...)
+		bumNetworkSpec := &udnv1.NetworkSpec{
+			Topology: udnv1.NetworkTopologyLayer2,
+			Layer2: &udnv1.Layer2Config{
+				Role:    udnv1.NetworkRolePrimary,
+				Subnets: randomL2CUDNSubnets(),
+			},
+			Transport: udnv1.TransportOptionEVPN,
+			EVPN: &udnv1.EVPNConfig{
+				MACVRF: &udnv1.VRFConfig{
+					VNI: randomVNI(),
+				},
+			},
+		}
+		bumNetworkSpec.Layer2.Subnets = matchL2SubnetsByIPFamilies(ipFamilySet, bumNetworkSpec.Layer2.Subnets...)
+
+		bumTestNamespace, externalServers := configureNetworkWithInfra(
+			f,
+			ictx,
+			bumTestNetworkName,
+			ipFamilySet,
+			bumTestNetworkName,
+			cudnAdvertisedEVPN,
+			bumNetworkSpec,
+		)
+		gomega.Expect(externalServers).NotTo(gomega.BeEmpty(), "MAC-VRF external agnhost container must exist for EVPN L2 test")
+		macVRFAgnhostContainer := externalServers[0]
+
+		extMACVRFIPs := make(map[utilnet.IPFamily]string)
+		for _, fam := range ipFamilySet.UnsortedList() {
+			for _, cidr := range bumNetworkSpec.Layer2.Subnets {
+				if (fam == utilnet.IPv6) != utilnet.IsIPv6CIDRString(string(cidr)) {
+					continue
+				}
+				_, ipNet, perr := net.ParseCIDR(string(cidr))
+				gomega.Expect(perr).NotTo(gomega.HaveOccurred())
+				extMACVRFIPs[fam] = secondToLastIP(ipNet).String()
+				break
+			}
+			gomega.Expect(extMACVRFIPs[fam]).NotTo(gomega.BeEmpty(), "MAC-VRF external IP for family %v", fam)
+		}
+
+		macVRFNetwork, err := infraprovider.Get().GetNetwork(macVRFAgnhostContainer)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		extAgnhostNetInf, err := infraprovider.Get().GetExternalContainerNetworkInterface(infraapi.ExternalContainer{Name: macVRFAgnhostContainer}, macVRFNetwork)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		extMAC := extAgnhostNetInf.MAC
+		gomega.Expect(extMAC).NotTo(gomega.BeEmpty())
+
+		vtepCRName := bumTestNetworkName + "-vtep"
+
+		nodes, err := e2enode.GetBoundedReadySchedulableNodes(context.Background(), f.ClientSet, 2)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(len(nodes.Items)).To(gomega.BeNumerically(">=", 2), "need at least 2 nodes (PodA on one node, tcpdump on another VTEP)")
+		nodeA, nodeB := nodes.Items[0].Name, nodes.Items[1].Name
+
+		ginkgo.By("Validation 1: Type-3 (BUM flood list) routes for each VTEP")
+		macVRFVNI := fmt.Sprintf("%d", bumNetworkSpec.EVPN.MACVRF.VNI)
+		allNodeList, err := f.ClientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		vtepIPs := sets.New[string]()
+		for _, n := range allNodeList.Items {
+			if ipFamilySet.Has(utilnet.IPv4) {
+				for _, ip := range e2enode.GetAddressesByTypeAndFamily(&n, corev1.NodeInternalIP, corev1.IPv4Protocol) {
+					vtepIPs.Insert(ip)
+				}
+			}
+			if ipFamilySet.Has(utilnet.IPv6) {
+				for _, ip := range e2enode.GetAddressesByTypeAndFamily(&n, corev1.NodeInternalIP, corev1.IPv6Protocol) {
+					vtepIPs.Insert(ip)
+				}
+			}
+		}
+		externalFRRIP, err := getExternalFRRIP(ipFamilySet)
+		gomega.Expect(err).NotTo(gomega.HaveOccurred(), "external FRR VTEP IP")
+		vtepIPs.Insert(externalFRRIP)
+		framework.Logf("Validation 1: expect Type-3 routes for VTEPs %v (VNI %s)", vtepIPs.UnsortedList(), macVRFVNI)
+		for _, node := range allNodeList.Items {
+			nodeName := node.Name
+			var output string
+			gomega.Eventually(func() bool {
+				var err1 error
+				output, err1 = execVtyshOnFRRK8s(f, nodeName, fmt.Sprintf("show bgp l2vpn evpn route vni %s type multicast", macVRFVNI))
+				if err1 != nil {
+					return false
+				}
+				for _, vtepIP := range vtepIPs.UnsortedList() {
+					if !strings.Contains(output, fmt.Sprintf("[3]:[0]:[32]:[%s]", vtepIP)) {
+						framework.Logf("node %s: missing Type-3 for VTEP %s", nodeName, vtepIP)
+						return false
+					}
+				}
+				return true
+			}, 60*time.Second, 5*time.Second).Should(gomega.BeTrue(), "Type-3 routes on %s, last output:\n%s", nodeName, output)
+			framework.Logf("node %s: Type-3 (multicast) on frr-k8s:\n%s", nodeName, output)
+		}
+
+		ginkgo.By("Place PodA on a dedicated node")
+		podASpec := e2epod.NewAgnhostPod(bumTestNamespace.Name, "pod-a", nil, nil, nil, "netexec")
+		podASpec.Spec.NodeName = nodeA
+		podA := e2epod.PodClientNS(f, bumTestNamespace.Name).CreateSync(context.Background(), podASpec)
+
+		podAIPs := make(map[utilnet.IPFamily]string, ipFamilySet.Len())
+		for _, fam := range ipFamilySet.UnsortedList() {
+			ip, ipErr := getPodAnnotationIPsForPrimaryNetworkByIPFamily(
+				f.ClientSet, podA.Namespace, podA.Name, bumTestNetworkName, fam,
+			)
+			gomega.Expect(ipErr).NotTo(gomega.HaveOccurred(), "PodA primary network annotation for IP family %v", fam)
+			gomega.Expect(ip).NotTo(gomega.BeEmpty(), "PodA must have a CUDN address for every cluster IP family (missing %v)", fam)
+			podAIPs[fam] = ip
+		}
+		podANetStatus, err := podNetworkStatus(podA, podNetworkStatusByNetConfigPredicate(bumTestNamespace.Name, bumTestNetworkName, "primary"))
+		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		gomega.Expect(podANetStatus).NotTo(gomega.BeEmpty())
+		podAMAC := podANetStatus[0].Mac
+		gomega.Expect(podAMAC).NotTo(gomega.BeEmpty())
+
+		ginkgo.By("Validation 2: Type-2 (MAC/IP) for PodA and MAC-VRF external agnhost on PodA's node")
+		var type2Output string
+		gomega.Eventually(func() bool {
+			var err1 error
+			type2Output, err1 = execVtyshOnFRRK8s(f, nodeA, fmt.Sprintf("show bgp l2vpn evpn route vni %s type macip", macVRFVNI))
+			framework.Logf("Type-2 MAC/IP routes on %s, vtysh out:\n%s", nodeA, type2Output)
+			if err1 != nil {
+				return false
+			}
+			for _, fam := range ipFamilySet.UnsortedList() {
+				nlriPod := evpnType2MACIPNLRI(podAMAC, podAIPs[fam], fam)
+				if !strings.Contains(strings.ToLower(type2Output), strings.ToLower(nlriPod)) {
+					framework.Logf("node %s: missing PodA Type-2 NLRI %q (family %v)", nodeA, nlriPod, fam)
+					return false
+				}
+				nlriExt := evpnType2MACIPNLRI(extMAC, extMACVRFIPs[fam], fam)
+				if !strings.Contains(strings.ToLower(type2Output), strings.ToLower(nlriExt)) {
+					framework.Logf("node %s: missing external MAC-VRF Type-2 NLRI %q (family %v)", nodeA, nlriExt, fam)
+					return false
+				}
+			}
+			return true
+		}, 60*time.Second, 5*time.Second).Should(gomega.BeTrue(), "Type-2 MAC/IP routes on %s, last vtysh out:\n%s", nodeA, type2Output)
+
+		ginkgo.By("Create hostNetwork tcpdump helpers on PodA's node and a second node (VXLAN visibility by direction)")
+		makeTCPDumpPod := func(name, node string) *corev1.Pod {
+			return e2epod.PodClientNS(f, bumTestNamespace.Name).CreateSync(context.Background(), &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: bumTestNamespace.Name},
+				Spec: corev1.PodSpec{
+					NodeName:      node,
+					HostNetwork:   true,
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{{
+						Name:            "tcpdump",
+						Image:           images.Netshoot(),
+						Command:         []string{"sleep", "3600"},
+						SecurityContext: &corev1.SecurityContext{Privileged: ptr.To(true)},
+					}},
+				},
+			})
+		}
+		tcpdumpPodA := makeTCPDumpPod("tcpdump-helper-a", nodeA)
+		// Remote-node helper: unknown-unicast flood from PodA (nodeA) must appear on another VTEP's VXLAN.
+		tcpdumpPodRemote := makeTCPDumpPod("tcpdump-helper-remote", nodeB)
+		extContainer := infraapi.ExternalContainer{Name: macVRFAgnhostContainer}
+
+		for fam, podAIP := range podAIPs {
+			familyStr := fmt.Sprintf("IPv%v", fam)
+			parsedPodA := net.ParseIP(podAIP)
+			gomega.Expect(parsedPodA).NotTo(gomega.BeNil())
+			parsedExtIP := net.ParseIP(extMACVRFIPs[fam])
+			gomega.Expect(parsedExtIP).NotTo(gomega.BeNil())
+
+			vxlanIf := evpnVxlanNameForVTEP(vtepCRName, fam)
+			framework.Logf("EVPN VXLAN iface for %s (VTEP CR %q): %s (PodA on %s, tcpdump also on %s)", familyStr, vtepCRName, vxlanIf, nodeA, nodeB)
+
+			ginkgo.By(fmt.Sprintf("Validation 3 (%s): unknown unicast is flooded (ARP/NS on %s)", familyStr, vxlanIf))
+			var unallocated string
+			for _, cidr := range bumNetworkSpec.Layer2.Subnets {
+				_, subnet, parseErr := net.ParseCIDR(string(cidr))
+				if parseErr != nil {
+					continue
+				}
+				if isV6 := utilnet.IsIPv6CIDRString(string(cidr)); (fam == utilnet.IPv6) != isV6 {
+					continue
+				}
+				// use thirdToLastIP to avoid the MAC-VRF external agnhost address which uses secondToLastIP in the same subnet
+				unallocated = thirdToLastIP(subnet).String()
+				break
+			}
+			gomega.Expect(unallocated).NotTo(gomega.BeEmpty(), "no unallocated %s in pod subnet for flood probe", familyStr)
+			probe := net.ParseIP(unallocated)
+			gomega.Expect(probe).NotTo(gomega.BeNil())
+			var bumToUnknownFilter string
+			if fam == utilnet.IPv4 {
+				bumToUnknownFilter = arpBroadcastRequestFilter(probe.To4())
+			} else {
+				bumToUnknownFilter = ndpBroadcastNSFilter(probe.To16())
+			}
+			floodCtx, stopFloodTraffic := context.WithCancel(context.Background())
+			bumE2EStartFloodAgnhostHTTP(floodCtx, bumTestNamespace.Name, podA.Name, unallocated, 0)
+			floodOut, floodErr := e2ekubectl.RunKubectl(
+				bumTestNamespace.Name, "exec", tcpdumpPodRemote.Name, "--", "sh", "-c",
+				fmt.Sprintf("timeout -s KILL 25 tcpdump -i %s -nne -c 1 %s 2>&1", vxlanIf, bumE2EQuoteTcpdumpFilter(bumToUnknownFilter)))
+			framework.Logf("tcpdump for %s on %s, floodErr=%v, output:\n%s", unallocated, vxlanIf, floodErr, floodOut)
+			stopFloodTraffic()
+			gomega.Expect(floodErr).NotTo(gomega.HaveOccurred(), "expected one flooded ARP/NS for %s on %s but did not receive it", unallocated, vxlanIf, floodOut)
+
+			ginkgo.By(fmt.Sprintf("Validation 4 (%s): BUM suppression both directions — no broadcast ARP/NS for known PodA or external IP on VXLAN (%s)", familyStr, vxlanIf))
+			var bumSupComboFilter string
+			if fam == utilnet.IPv4 {
+				bumSupComboFilter = fmt.Sprintf("(%s) or (%s)",
+					arpBroadcastRequestFilter(parsedPodA.To4()),
+					arpBroadcastRequestFilter(parsedExtIP.To4()))
+			} else {
+				bumSupComboFilter = fmt.Sprintf("(%s) or (%s)",
+					ndpBroadcastNSFilter(parsedPodA.To16()),
+					ndpBroadcastNSFilter(parsedExtIP.To16()))
+			}
+			var supOutA, supOutB string
+			var supWg sync.WaitGroup
+			var supErrA, supErrB error
+			supWg.Add(2)
+			go func() {
+				defer supWg.Done()
+				supOutA, supErrA = e2ekubectl.RunKubectl(
+					bumTestNamespace.Name, "exec", tcpdumpPodA.Name, "--", "sh", "-c",
+					fmt.Sprintf("timeout -s KILL 25 tcpdump -i %s -nne -c 1 %s 2>&1", vxlanIf, bumE2EQuoteTcpdumpFilter(bumSupComboFilter)))
+			}()
+			go func() {
+				defer supWg.Done()
+				supOutB, supErrB = e2ekubectl.RunKubectl(
+					bumTestNamespace.Name, "exec", tcpdumpPodRemote.Name, "--", "sh", "-c",
+					fmt.Sprintf("timeout -s KILL 25 tcpdump -i %s -nne -c 1 %s 2>&1", vxlanIf, bumE2EQuoteTcpdumpFilter(bumSupComboFilter)))
+			}()
+			time.Sleep(5 * time.Second)
+			bumE2EStartFloodAgnhostHTTP(context.Background(), bumTestNamespace.Name, podA.Name, extMACVRFIPs[fam], 3)
+			bumE2EStartFloodFromExternal(context.Background(), macVRFAgnhostContainer, podAIP, 3)
+			supWg.Wait()
+			framework.Logf("tcpdump node %s for PodA %s OR external %s on %s:\n%s", nodeA, podAIP, extMACVRFIPs[fam], vxlanIf, supOutA)
+			framework.Logf("tcpdump node %s for PodA %s OR external %s on %s:\n%s", nodeB, podAIP, extMACVRFIPs[fam], vxlanIf, supOutB)
+			gomega.Expect(supErrA).To(gomega.HaveOccurred(),
+				fmt.Sprintf("node %s: received broadcast ARP/NS for PodA %s or external %s on %s unexpectedly", nodeA, podAIP, extMACVRFIPs[fam], vxlanIf))
+			gomega.Expect(supErrB).To(gomega.HaveOccurred(),
+				fmt.Sprintf("node %s: received broadcast ARP/NS for PodA %s or external %s on %s unexpectedly", nodeB, podAIP, extMACVRFIPs[fam], vxlanIf))
+			_, errReachExt := e2ekubectl.RunKubectl(
+				bumTestNamespace.Name, "exec", podA.Name, "--",
+				"curl", "-g", "-f", "-s", "-S", "-m", "3", bumE2EAgnhostNetexecURL(extMACVRFIPs[fam]),
+			)
+			gomega.Expect(errReachExt).NotTo(gomega.HaveOccurred(),
+				"%s: PodA should reach external MAC-VRF agnhost at %s", familyStr, bumE2EAgnhostNetexecURL(extMACVRFIPs[fam]))
+			_, errReachPodFromExt := infraprovider.Get().ExecExternalContainerCommand(extContainer,
+				[]string{"curl", "-g", "-f", "-s", "-S", "-m", "3", bumE2EAgnhostNetexecURL(podAIP)},
+			)
+			gomega.Expect(errReachPodFromExt).NotTo(gomega.HaveOccurred(),
+				"%s: external MAC-VRF agnhost should reach PodA at %s", familyStr, bumE2EAgnhostNetexecURL(podAIP))
+		}
+		framework.Logf("BUM suppression: done for all families for network %q", bumTestNetworkName)
+	})
 })
+
+// getFRRK8sPodOnNode returns the frr-k8s DaemonSet pod on the given node.
+func getFRRK8sPodOnNode(f *framework.Framework, nodeName string) (*corev1.Pod, error) {
+	ns := deploymentconfig.Get().FRRK8sNamespace()
+	pods, err := f.ClientSet.CoreV1().Pods(ns).List(context.Background(), metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + nodeName,
+		LabelSelector: "app=frr-k8s",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list frr-k8s pods in %s: %w", ns, err)
+	}
+	if len(pods.Items) != 1 {
+		return nil, fmt.Errorf("expected 1 frr-k8s daemon on node %s, got %d", nodeName, len(pods.Items))
+	}
+	p := &pods.Items[0]
+	if !podutils.IsPodReady(p) {
+		return nil, fmt.Errorf("frr-k8s pod on node %s is not ready", nodeName)
+	}
+	return p, nil
+}
+
+// execVtyshOnFRRK8s runs a vtysh -c command in the FRR sidecar of the frr-k8s pod on the given node.
+func execVtyshOnFRRK8s(f *framework.Framework, nodeName string, vtyshCmd string) (string, error) {
+	pod, err := getFRRK8sPodOnNode(f, nodeName)
+	if err != nil {
+		return "", err
+	}
+	args := []string{"exec", pod.Name, "-c", frrContainerName, "--", "vtysh", "-c", vtyshCmd}
+	return e2ekubectl.RunKubectl(deploymentconfig.Get().FRRK8sNamespace(), args...)
+}
+
+// bumE2EQuoteTcpdumpFilter wraps a BPF for safe use in sh -c for tcpdump.
+func bumE2EQuoteTcpdumpFilter(f string) string {
+	return `'` + strings.ReplaceAll(f, `'`, `'"'"'`) + `'`
+}
+
+// bumE2EAgnhostNetexecURL is the in-pod URL for the default agnhost netexec --http-port=%d/hostname (see netexecPort). Uses net.JoinHostPort for IPv4/IPv6.
+func bumE2EAgnhostNetexecURL(host string) string {
+	return fmt.Sprintf("http://%s/hostname", net.JoinHostPort(host, strconv.Itoa(netexecPort)))
+}
+
+// bumE2EStartFloodAgnhostHTTP issues periodic HTTP GETs from podA to agnhost
+// on targetIP in a background goroutine. maxIterations limits the number of
+// requests (0 means unlimited, loop until ctx is cancelled).
+func bumE2EStartFloodAgnhostHTTP(ctx context.Context, namespace, podAName, targetIP string, maxIterations int) {
+	url := bumE2EAgnhostNetexecURL(targetIP)
+	go func() {
+		for i := 0; maxIterations == 0 || i < maxIterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			_, _ = e2ekubectl.RunKubectl(namespace, "exec", podAName, "--", "curl", "-g", "-s", "-o", "/dev/null", "-m", "1", "--connect-timeout", "1", url)
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+}
+
+// bumE2EStartFloodFromExternal issues periodic HTTP GETs from the MAC-VRF external agnhost to targetIP (Pod IP).
+func bumE2EStartFloodFromExternal(ctx context.Context, macVRFAgnhostContainerName, targetIP string, maxIterations int) {
+	ext := infraapi.ExternalContainer{Name: macVRFAgnhostContainerName}
+	url := bumE2EAgnhostNetexecURL(targetIP)
+	go func() {
+		for i := 0; maxIterations == 0 || i < maxIterations; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			_, _ = infraprovider.Get().ExecExternalContainerCommand(ext,
+				[]string{"curl", "-g", "-s", "-o", "/dev/null", "-m", "1", "--connect-timeout", "1", url})
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+}
+
+// arpBroadcastRequestFilter matches an IPv4 ARP who-has to targetIP with broadcast eth dst.
+func arpBroadcastRequestFilter(targetIP net.IP) string {
+	ip := targetIP.To4()
+	if ip == nil {
+		return ""
+	}
+	return fmt.Sprintf("arp and ether dst ff:ff:ff:ff:ff:ff and arp[6:2] == 0x0001 and arp[24:4] == 0x%02x%02x%02x%02x",
+		ip[0], ip[1], ip[2], ip[3])
+}
+
+// ndpBroadcastNSFilter matches an ICMPv6 Neighbor Solicitation to targetIP with solicited-node multicast dmac.
+func ndpBroadcastNSFilter(targetIP net.IP) string {
+	ip := targetIP.To16()
+	if ip == nil {
+		return ""
+	}
+	if len(ip) != 16 {
+		return ""
+	}
+	return fmt.Sprintf("icmp6 and ip6[40] == 135 and ether[0:2] == 0x3333"+
+		" and ip6[48:4] == 0x%02x%02x%02x%02x"+
+		" and ip6[52:4] == 0x%02x%02x%02x%02x"+
+		" and ip6[56:4] == 0x%02x%02x%02x%02x"+
+		" and ip6[60:4] == 0x%02x%02x%02x%02x",
+		ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7], ip[8], ip[9], ip[10], ip[11], ip[12], ip[13], ip[14], ip[15])
+}
 
 // routeAdvertisementsReadyFunc returns a function that checks for the
 // Accepted condition in the provided RouteAdvertisements
@@ -2976,8 +3345,7 @@ func runBGPNetworkAndServer(
 		return fmt.Errorf("failed to generate FRR-k8s configuration: %w", err)
 	}
 	ictx.AddCleanUpFn(func() error { return os.RemoveAll(frrK8sConfig) })
-	_, err = e2ekubectl.RunKubectl(deploymentconfig.Get().FRRK8sNamespace(), "create", "-f", frrK8sConfig)
-	if err != nil {
+	if err := frrK8sKubectlCreateFile(deploymentconfig.Get().FRRK8sNamespace(), frrK8sConfig); err != nil {
 		return fmt.Errorf("failed to apply FRRConfiguration: %w", err)
 	}
 	ictx.AddCleanUpFn(func() error {
