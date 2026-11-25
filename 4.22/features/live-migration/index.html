@@ -5213,10 +5213,16 @@ fedora<span class="w">   </span>9m42s<span class="w">   </span>Running<span clas
 </code></pre></div><p></p>
 <p>Also we can check the neighbours cache to verify it later on
 </p><div class="highlight"><pre><span></span><code><span class="o">[</span>fedora@fedora<span class="w"> </span>~<span class="o">]</span>arp<span class="w"> </span>-a
-_gateway<span class="w"> </span><span class="o">(</span><span class="m">10</span>.244.2.1<span class="o">)</span><span class="w"> </span>at<span class="w"> </span>0a:58:a9:fe:01:01<span class="w"> </span><span class="o">[</span>ether<span class="o">]</span><span class="w"> </span>on<span class="w"> </span>eth0
+_gateway<span class="w"> </span><span class="o">(</span><span class="m">10</span>.244.2.1<span class="o">)</span><span class="w"> </span>at<span class="w"> </span>0a:58:0a:f4:02:01<span class="w"> </span><span class="o">[</span>ether<span class="o">]</span><span class="w"> </span>on<span class="w"> </span>eth0
 </code></pre></div><p></p>
-<p>The default gateway is the pod network subnet gateway IP. The ARP proxy feature
-ensures the gateway MAC address remains consistent across live migrations.</p>
+<p>The default IPv4 gateway is the pod network subnet gateway IP. On its subnet's
+owning node it resolves to that node's logical router port MAC; on other nodes
+it resolves to the ARP proxy MAC. When the migration target domain becomes ready,
+OVN-Kubernetes sends gratuitous ARPs from the target node's management port to
+refresh the guest's gateway mapping with the ARP proxy MAC on every node,
+including on return to the subnet owner. A subsequent ARP resolution on the
+owning node may restore its LRP MAC; the next migration refreshes the mapping
+again. The guest's IPv6 gateway configuration is unchanged.</p>
 <div class="highlight"><pre><span></span><code><span class="o">[</span>fedora@fedora<span class="w"> </span>~<span class="o">]</span>ip<span class="w"> </span>route
 default<span class="w"> </span>via<span class="w"> </span><span class="m">10</span>.244.2.1<span class="w"> </span>dev<span class="w"> </span>eth0<span class="w"> </span>proto<span class="w"> </span>dhcp<span class="w"> </span>src<span class="w"> </span><span class="m">10</span>.244.2.26<span class="w"> </span>metric<span class="w"> </span><span class="m">100</span>
 <span class="m">10</span>.244.2.0/24<span class="w"> </span>dev<span class="w"> </span>eth0<span class="w"> </span>proto<span class="w"> </span>kernel<span class="w"> </span>scope<span class="w"> </span>link<span class="w"> </span>src<span class="w"> </span><span class="m">10</span>.244.2.26<span class="w"> </span>metric<span class="w"> </span><span class="m">100</span>
@@ -5230,7 +5236,8 @@ kubectl<span class="w"> </span>get<span class="w"> </span>vmim<span class="w"> <
 <span class="w">    </span>migrationState:
 <span class="w">      </span>completed:<span class="w"> </span><span class="nb">true</span>
 </code></pre></div><p></p>
-<p>After migration, the network configuration is the same - including the GW neighbor cache.
+<p>After migration, the IP configuration is the same. The IPv4 gateway neighbor
+entry is refreshed for the destination node.
 </p><div class="highlight"><pre><span></span><code>oc<span class="w"> </span>get<span class="w"> </span>vmi<span class="w"> </span>-A
 NAMESPACE<span class="w">   </span>NAME<span class="w">     </span>AGE<span class="w">   </span>PHASE<span class="w">     </span>IP<span class="w">            </span>NODENAME<span class="w">     </span>READY
 default<span class="w">     </span>fedora<span class="w">   </span>16m<span class="w">   </span>Running<span class="w">   </span><span class="m">10</span>.244.2.26<span class="w">   </span>ovn-worker<span class="w">   </span>True
@@ -5325,7 +5332,7 @@ ignition yaml:</p>
 <p>To implement live migration ovn-kubernetes do the following:
 - Send DHCP replies advertising the allocated IP address and subnet gateway to the guest VM (via OVN-Kubernetes DHCP options configured for the logical switch ports).
 - A point to point routing is used so one node's subnet IP can be routed from different node
-- The VM's gateway IP (subnet gateway) and MAC are kept consistent across nodes using ARP proxy</p>
+- The VM's IPv4 gateway IP (subnet gateway) is preserved, and gratuitous ARPs update its gateway MAC after migration</p>
 <p><strong>Point to point routing:</strong></p>
 <p>When the VM is running at a node that does not "own" it's IP address - e.g. after a live migration - 
 after a live migration, do point to point routing with a policy for non 
